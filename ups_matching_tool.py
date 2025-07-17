@@ -81,7 +81,7 @@ if uploaded_shipment and uploaded_accounts:
                     'Recipient Company Name': row['Recipient Company Name'],
                     'Matched Account': acct,
                     'Similarity Score': round(score, 3),
-                    'Suggestions': ', '.join(suggestions),
+                    'Suggestions': ', '.join(str(s) for s in suggestions if pd.notna(s)),
                     'Match Notes': comment
                 })
 
