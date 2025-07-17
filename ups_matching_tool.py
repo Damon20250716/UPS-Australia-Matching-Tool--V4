@@ -1,107 +1,108 @@
-
 import streamlit as st
 import pandas as pd
+import difflib
 import re
-from rapidfuzz import process, fuzz
+import io
 
-# ---------------------- Normalization Utilities ---------------------- #
+st.set_page_config(page_title="UPS Australia Matching Tool", layout="wide")
+
+# ---------- Normalization Helper ----------
 def normalize_name(name):
     if pd.isna(name):
-        return ""
-    name = name.upper()
-    name = re.sub(r'[.,&/\\-]', ' ', name)
+        return ''
+    name = str(name).upper()
+    name = re.sub(r'[^A-Z0-9 ]', '', name)  # Remove punctuation
+    name = re.sub(r'\b(AUSTRALIA|AUST|PTY|P/L|LTD|LIMITED|CORPORATION|INC|PTE|CO|THE|AND|&)\b', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
+    return name
 
-    # Replace known abbreviations
-    replacements = {
-        "LABS": "LABORATORIES",
-        "AUST": "AUSTRALIA",
-        "P L": "PTY LTD",
-        "P/L": "PTY LTD",
-        "P.L.": "PTY LTD",
-        "PTY. LTD": "PTY LTD",
-        "LTD": "",
-        "LIMITED": "",
-        "CO": "COMPANY",
-    }
-    for k, v in replacements.items():
-        name = name.replace(k, v)
-    name = re.sub(r'PTY LTD|AUSTRALIA|LIMITED|CORPORATION|INCORPORATED|INC|LTD|LLC', '', name)
-    return name.strip()
+# ---------- Matching Function with improved personal name heuristic ----------
+def match_recipient_to_account(recipient_name, acc_df, threshold):
+    normalized_recipient = normalize_name(recipient_name)
 
-def is_personal_name(name):
-    return len(name.split()) <= 2 and not any(x in name.upper() for x in ['PTY', 'LTD', 'INC', 'CO', 'CORP'])
-
-# ---------------------- Matching Logic ---------------------- #
-def match_recipient_to_account(rec_name, account_df, threshold):
-    rec_norm = normalize_name(rec_name)
-    if is_personal_name(rec_name):
-        return 'Cash', 0, [], 'Likely personal name'
-
-    acc_df = account_df.copy()
     acc_df['Normalized Name'] = acc_df['Customer Name'].apply(normalize_name)
 
-    # First round: high threshold fuzzy match
-    best_match = process.extractOne(
-        rec_norm,
-        acc_df['Normalized Name'],
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=threshold
+    # Compute similarity scores
+    acc_df['Similarity'] = acc_df['Normalized Name'].apply(
+        lambda x: difflib.SequenceMatcher(None, normalized_recipient, x).ratio()
     )
-    if best_match:
-        idx = acc_df[acc_df['Normalized Name'] == best_match[0]].index[0]
-        return acc_df.at[idx, 'Account Number'], best_match[1], [acc_df.at[idx, 'Customer Name']], 'High confidence'
 
-    # Second round: try partial matching with relaxed threshold
-    fallback_match = process.extractOne(
-        rec_norm,
-        acc_df['Normalized Name'],
-        scorer=fuzz.partial_ratio,
-        score_cutoff=threshold - 10
-    )
-    if fallback_match:
-        idx = acc_df[acc_df['Normalized Name'] == fallback_match[0]].index[0]
-        return acc_df.at[idx, 'Account Number'], fallback_match[1], [acc_df.at[idx, 'Customer Name']], 'Partial fallback match'
+    sorted_matches = acc_df.sort_values(by='Similarity', ascending=False)
+    top_matches = sorted_matches.head(3)
 
-    return 'Cash', 0, [], 'No confident match'
+    high_conf_matches = top_matches[top_matches['Similarity'] >= threshold]
 
-# ---------------------- Streamlit App ---------------------- #
-st.set_page_config(page_title="UPS AU Matching Tool", layout="wide")
+    if len(high_conf_matches) == 1:
+        best_match = high_conf_matches.iloc[0]
+        return best_match['Account Number'], best_match['Similarity'], list(top_matches['Customer Name']), "✅ One strong match"
+    
+    elif len(high_conf_matches) > 1:
+        # Check if first two words match
+        rec_words = normalized_recipient.split()[:2]
+        for _, row in high_conf_matches.iterrows():
+            acc_words = row['Normalized Name'].split()[:2]
+            if rec_words == acc_words:
+                return row['Account Number'], row['Similarity'], list(top_matches['Customer Name']), "✅ First-two-word match"
+
+        best_match = high_conf_matches.iloc[0]
+        return best_match['Account Number'], best_match['Similarity'], list(top_matches['Customer Name']), "⚠ Multiple close matches"
+
+    # Improved personal name heuristic:
+    company_indicators = ['PTY', 'LTD', 'P/L', 'LABS', 'LABORATORIES', 'CORPORATION', 'INC', 'CO']
+    if (len(normalized_recipient.split()) <= 1 and 
+        not any(indicator in recipient_name.upper() for indicator in company_indicators)):
+        return "Cash", 0, [], "👤 Treated as personal name"
+
+    return "Cash", 0, list(top_matches['Customer Name']), "❌ No good match"
+
+# ---------- UI ----------
 st.title("🇦🇺 UPS AU Recipient Name Matching Tool")
 
-uploaded_ship = st.file_uploader("Upload Shipment File (Excel)", type=["xlsx"])
-uploaded_acc = st.file_uploader("Upload Account File (Excel)", type=["xlsx"])
-threshold = st.slider("Similarity Threshold", 70, 100, 85)
+uploaded_shipment = st.file_uploader("📦 Upload Shipment File (Excel)", type=["xls", "xlsx"])
+uploaded_accounts = st.file_uploader("📒 Upload Account File (Excel)", type=["xls", "xlsx"])
 
-if uploaded_ship and uploaded_acc:
-    ship_df = pd.read_excel(uploaded_ship)
-    acc_df = pd.read_excel(uploaded_acc)
+threshold = st.slider("🔧 Similarity Threshold", 0.5, 1.0, 0.8, 0.01)
 
-    if not all(col in ship_df.columns for col in ['Tracking Number', 'Recipient Company Name']):
-        st.error("Shipment file must contain 'Tracking Number' and 'Recipient Company Name' columns.")
-    elif not all(col in acc_df.columns for col in ['Customer Name', 'Account Number']):
-        st.error("Account file must contain 'Customer Name' and 'Account Number' columns.")
-    else:
-        results = []
-        for _, row in ship_df.iterrows():
-            acct, score, suggestions, comment = match_recipient_to_account(
-                row['Recipient Company Name'], acc_df, threshold
+if uploaded_shipment and uploaded_accounts:
+    try:
+        ship_df = pd.read_excel(uploaded_shipment)
+        acc_df = pd.read_excel(uploaded_accounts)
+
+        if 'Recipient Company Name' not in ship_df.columns or 'Customer Name' not in acc_df.columns:
+            st.error("❌ Required columns missing. Make sure files have 'Recipient Company Name' and 'Customer Name'.")
+        else:
+            results = []
+            for _, row in ship_df.iterrows():
+                acct, score, suggestions, comment = match_recipient_to_account(
+                    row['Recipient Company Name'], acc_df, threshold
+                )
+                results.append({
+                    'Tracking Number': row.get('Tracking Number', ''),
+                    'Recipient Company Name': row['Recipient Company Name'],
+                    'Matched Account': acct,
+                    'Similarity Score': round(score, 3),
+                    'Suggestions': ', '.join(suggestions),
+                    'Match Notes': comment
+                })
+
+            result_df = pd.DataFrame(results)
+            st.success("✅ Matching complete. Preview below:")
+            st.dataframe(result_df, use_container_width=True)
+
+            # Download helper
+            def convert_df(df):
+                output = io.BytesIO()
+                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                    df.to_excel(writer, index=False)
+                return output.getvalue()
+
+            st.download_button(
+                label="📥 Download Matching Result",
+                data=convert_df(result_df),
+                file_name="matching_result.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-            results.append({
-                "Tracking Number": row['Tracking Number'],
-                "Recipient Company Name": row['Recipient Company Name'],
-                "Assigned Account": acct,
-                "Match Score": score,
-                "Top Suggestion": suggestions[0] if suggestions else "",
-                "Comment": comment
-            })
-        result_df = pd.DataFrame(results)
-        st.dataframe(result_df.style.apply(
-            lambda row: ['background-color: red' if row.Match_Score < threshold and row.Assigned_Account == 'Cash' else
-                         'background-color: yellow' if row.Match_Score < threshold else
-                         'background-color: lightgreen'] * len(row), axis=1))
-
-        # Download option
-        def convert_df(df):
-            return df.to_excel(index=False, engine='openpyxl')
-        st.download_button("Download Result as Excel", convert_df(result_df), "matching_result.xlsx")
+    except Exception as e:
+        st.error(f"❌ Error processing file: {e}")
+else:
+    st.info("👆 Please upload both shipment and account files.")
